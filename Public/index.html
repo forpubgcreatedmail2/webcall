@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Dial – Chat & Call Demo (Final Stable)</title>
+<style>
+  body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#eef2ff;height:100vh;display:flex;flex-direction:column}
+  .topbar{padding:10px 16px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between}
+  .content{flex:1;display:grid;grid-template-columns:280px 1fr 320px;gap:10px;padding:10px}
+  .panel{background:#fff;border-radius:8px;padding:10px;box-shadow:0 0 6px rgba(0,0,0,0.08);display:flex;flex-direction:column}
+  .messages{flex:1;overflow:auto;padding:8px;background:#f7f9ff;border-radius:6px}
+  .bubble{margin:4px 0;padding:8px;border-radius:8px;display:inline-block;max-width:75%}
+  .videos{display:flex;gap:10px;justify-content:center;margin-top:10px}
+  video{width:140px;height:100px;background:#000;border-radius:6px;object-fit:cover}
+  button{padding:8px 12px;border-radius:6px;border:0;cursor:pointer;margin:4px}
+  .btn{background:#2b8cff;color:#fff}
+  .hang{background:#e04f5f;color:#fff}
+  .muted{background:#f0f0f0}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,0.36);display:flex;align-items:center;justify-content:center;z-index:99}
+  .overlay>div{background:#fff;padding:20px;border-radius:8px;text-align:center}
+  .user-list{display:flex;gap:8px;margin-top:8px}
+  .user-list button{flex:1}
+  .active{box-shadow:inset 0 0 0 2px rgba(43,140,255,0.14)}
+  @media(max-width:900px){.content{grid-template-columns:1fr}}
+</style>
+<link rel="icon" href="data:,">
+</head>
+<body>
+  <div class="topbar">
+    <div><b id="currentUser">Not set</b> | Peer: <span id="currentPeer">—</span></div>
+    <div id="status">Idle</div>
+  </div>
+
+  <div class="content">
+    <div class="panel">
+      <h4>Trial Users</h4>
+      <div class="user-list">
+        <button id="setUserA" class="muted">Use UserA</button>
+        <button id="setUserB" class="muted">Use UserB</button>
+      </div>
+      <hr/>
+      <h4>Connect</h4>
+      <input id="targetId" placeholder="Target user" style="padding:8px;border-radius:6px;border:1px solid #ddd"/>
+      <button id="connectBtn" class="btn">Connect WS</button>
+      <div id="wsStatus" style="font-size:13px;color:#666;margin-top:6px">Not connected</div>
+    </div>
+
+    <div class="panel">
+      <div class="messages" id="messages"></div>
+      <div style="display:flex;margin-top:8px">
+        <input id="msgInput" placeholder="Type message..." style="flex:1;padding:8px;border-radius:6px;border:1px solid #ccc"/>
+        <button id="sendBtn" class="btn">Send</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h4>Call</h4>
+      <div class="videos">
+        <div>
+          <div style="font-size:13px;color:#555">Local</div>
+          <video id="localVideo" autoplay playsinline muted></video>
+        </div>
+        <div>
+          <div style="font-size:13px;color:#555">Remote</div>
+          <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+      </div>
+
+      <div style="text-align:center;margin-top:12px">
+        <button id="callBtn" class="btn">Start Call</button>
+        <button id="hangupBtn" class="hang" disabled>Hang Up</button>
+      </div>
+      <div style="text-align:center;margin-top:8px">
+        <button id="muteBtn" class="muted">Mute</button>
+        <button id="videoBtn" class="muted">Video Off</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="ringOverlay" class="overlay" style="display:none">
+    <div>
+      <div>📞 Incoming call from <b id="ringFrom"></b></div>
+      <div style="margin-top:12px">
+        <button id="acceptBtn" class="btn">Accept</button>
+        <button id="rejectBtn" class="hang">Reject</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* Same robust WebRTC client — only change: clicking Use UserA / Use UserB
+   will set the current user and automatically set the target to the other user.
+   No more manual typing of UserA/UserB each time.
+*/
+
+let ws = null;
+let userId = null;
+let peerId = null;
+
+let pc = null;
+let localStream = null;
+const pendingIce = {}; // { fromId: [candidates...] }
+
+let isMuted = false, videoOff = false;
+
+// UI refs
+const wsStatus = document.getElementById('wsStatus');
+const currentUserEl = document.getElementById('currentUser');
+const currentPeerEl = document.getElementById('currentPeer');
+const messagesEl = document.getElementById('messages');
+const msgInput = document.getElementById('msgInput');
+const localVideo = document.getElementById('localVideo');
+const remoteVideo = document.getElementById('remoteVideo');
+const ringOverlay = document.getElementById('ringOverlay');
+const ringFrom = document.getElementById('ringFrom');
+const statusEl = document.getElementById('status');
+
+const setUserABtn = document.getElementById('setUserA');
+const setUserBBtn = document.getElementById('setUserB');
+const targetInput = document.getElementById('targetId');
+
+setUserABtn.onclick = () => autoSetUser('UserA');
+setUserBBtn.onclick = () => autoSetUser('UserB');
+
+function autoSetUser(u) {
+  // Set the user
+  userId = u;
+  currentUserEl.textContent = 'You: ' + u;
+
+  // auto-set the target to the other user
+  const other = (u === 'UserA') ? 'UserB' : 'UserA';
+  targetInput.value = other;
+
+  // visually mark active button
+  if (u === 'UserA') {
+    setUserABtn.classList.add('active');
+    setUserBBtn.classList.remove('active');
+  } else {
+    setUserBBtn.classList.add('active');
+    setUserABtn.classList.remove('active');
+  }
+}
+
+/* Rest of the code unchanged — connectWS, signaling, WebRTC flow, etc. */
+
+document.getElementById('connectBtn').onclick = connectWS;
+document.getElementById('sendBtn').onclick = sendMessage;
+document.getElementById('callBtn').onclick = startCall;
+document.getElementById('hangupBtn').onclick = hangup;
+document.getElementById('muteBtn').onclick = toggleMute;
+document.getElementById('videoBtn').onclick = toggleVideo;
+document.getElementById('acceptBtn').onclick = acceptIncoming;
+document.getElementById('rejectBtn').onclick = () => { hideRinging(); sendSig('reject', peerId, {}); cleanup(); };
+
+msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+
+function connectWS() {
+  if (!userId) return alert('Choose a user first (click Use UserA or Use UserB)');
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.onopen = () => { wsStatus.textContent = 'Connected'; ws.send(JSON.stringify({ type: 'register', from: userId })); };
+  ws.onclose = () => { wsStatus.textContent = 'Disconnected'; };
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'message') appendMsg(msg.from + ': ' + msg.data.text, false);
+    else if (['offer', 'answer', 'ice', 'reject', 'hangup'].includes(msg.type)) handleSignaling(msg);
+  };
+}
+
+function sendMessage() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return alert('Connect WS first');
+  const text = msgInput.value.trim(); if (!text) return;
+  const to = targetInput.value.trim();
+  if (!to) return alert('Enter target id (auto-filled when you choose a user)');
+  ws.send(JSON.stringify({ type: 'message', from: userId, to, data: { text } }));
+  appendMsg('Me: ' + text, true);
+  msgInput.value = '';
+}
+function appendMsg(t, me) {
+  const d = document.createElement('div');
+  d.className = 'bubble ' + (me ? 'me' : 'other');
+  d.textContent = t;
+  messagesEl.appendChild(d);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+/* -------------------------
+   Helper: getLocalStream (cached)
+   ------------------------- */
+async function getLocalStream() {
+  if (localStream) return localStream;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    localVideo.srcObject = localStream;
+    localVideo.muted = true;
+    return localStream;
+  } catch (err) {
+    alert('Microphone/camera permission required: ' + (err && err.message ? err.message : err));
+    throw err;
+  }
+}
+
+/* -------------------------
+   Create PeerConnection once and set handlers
+   ------------------------- */
+function createPeerConnection() {
+  if (pc) return pc;
+  pc = new RTCPeerConnection({
+  iceServers: [
+  { urls: ["stun:stun.l.google.com:19302"] },
+  {
+    urls: "turn:openrelay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject"
+  }
+]
+
+});
+
+  pc.onicecandidate = e => {
+    if (e.candidate) sendSig('ice', peerId, e.candidate);
+  };
+
+  pc.ontrack = e => {
+    // set remote stream only once, then play when metadata loaded
+    if (!remoteVideo.srcObject) {
+      remoteVideo.srcObject = e.streams[0];
+      remoteVideo.onloadedmetadata = () => {
+        remoteVideo.play().catch(err => console.warn('remote play failed', err));
+      };
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log('PC state', pc.connectionState, pc.iceConnectionState);
+    if (pc.connectionState === 'connected') sendStatus('connected');
+    if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') sendStatus('failed');
+  };
+
+  return pc;
+}
+
+/* -------------------------
+   Add local tracks (avoid duplicates)
+   ------------------------- */
+async function addLocalTracksToPC() {
+  const stream = await getLocalStream();
+  const existingSenders = pc.getSenders().map(s => s.track).filter(Boolean);
+  stream.getTracks().forEach(track => {
+    if (!existingSenders.includes(track)) pc.addTrack(track, stream);
+  });
+}
+
+/* -------------------------
+   Start Call (caller)
+   ------------------------- */
+async function startCall() {
+  const to = targetInput.value.trim();
+  if (!to) return alert('Enter target id');
+  peerId = to;
+  currentPeerEl.textContent = 'Peer: ' + peerId;
+  sendStatus('calling');
+
+  createPeerConnection();
+  await addLocalTracksToPC();
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  sendSig('offer', peerId, offer);
+  document.getElementById('hangupBtn').disabled = false;
+}
+
+/* -------------------------
+   Handle Signaling messages
+   ------------------------- */
+async function handleSignaling(msg) {
+  const { type, from, data } = msg;
+
+  if (type === 'offer') {
+    // incoming call: show ringing UI and store offer
+    peerId = from;
+    currentPeerEl.textContent = 'Peer: ' + peerId;
+    ringFrom.textContent = from;
+    showRinging();
+    window._incomingOffer = data;
+    return;
+  }
+
+  if (type === 'answer') {
+    if (!pc) {
+      createPeerConnection();
+      await addLocalTracksToPC();
+    }
+    await pc.setRemoteDescription(new RTCSessionDescription(data));
+    await drainPendingIce(from);
+    return;
+  }
+
+  if (type === 'ice') {
+    if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+      try { await pc.addIceCandidate(data); }
+      catch (e) { console.warn('addIceCandidate failed', e); }
+    } else {
+      pendingIce[from] = pendingIce[from] || [];
+      pendingIce[from].push(data);
+      console.log('Buffered ICE from', from);
+    }
+    return;
+  }
+
+  if (type === 'reject') {
+    hideRinging();
+    alert('Call rejected by ' + from);
+    cleanup();
+    return;
+  }
+
+  if (type === 'hangup') {
+    alert('Call ended');
+    cleanup();
+    return;
+  }
+}
+
+/* drain buffered ICE candidates for a peer */
+async function drainPendingIce(from) {
+  const list = pendingIce[from] || [];
+  for (const cand of list) {
+    try { await pc.addIceCandidate(cand); } catch (e) { console.warn('drain candidate failed', e); }
+  }
+  pendingIce[from] = [];
+}
+
+/* -------------------------
+   Accept incoming call (callee)
+   ------------------------- */
+async function acceptIncoming() {
+  hideRinging();
+  if (!window._incomingOffer) return alert('No incoming offer');
+  peerId = peerId || targetInput.value.trim();
+  currentPeerEl.textContent = 'Peer: ' + peerId;
+  sendStatus('connecting');
+
+  createPeerConnection();
+  await addLocalTracksToPC();
+
+  await pc.setRemoteDescription(new RTCSessionDescription(window._incomingOffer));
+  await drainPendingIce(peerId);
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  sendSig('answer', peerId, answer);
+
+  document.getElementById('hangupBtn').disabled = false;
+  sendStatus('connected');
+  window._incomingOffer = null;
+}
+
+/* -------------------------
+   Hangup / cleanup
+   ------------------------- */
+function hangup() {
+  sendSig('hangup', peerId, {});
+  cleanup();
+}
+function cleanup() {
+  try { if (pc) pc.close(); } catch (e) { console.warn(e); }
+  pc = null;
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+  localVideo.srcObject = null;
+  remoteVideo.srcObject = null;
+  sendStatus('idle');
+  document.getElementById('hangupBtn').disabled = true;
+}
+
+/* -------------------------
+   Controls
+   ------------------------- */
+function toggleMute() {
+  if (!localStream) return;
+  isMuted = !isMuted;
+  localStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+}
+function toggleVideo() {
+  if (!localStream) return;
+  videoOff = !videoOff;
+  localStream.getVideoTracks().forEach(t => t.enabled = !videoOff);
+}
+
+/* -------------------------
+   UI helpers + signaling helper
+   ------------------------- */
+function sendSig(type, to, data) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type, from: userId, to, data }));
+}
+function showRinging() { ringOverlay.style.display = 'flex'; }
+function hideRinging() { ringOverlay.style.display = 'none'; }
+function sendStatus(s) { statusEl.textContent = s.charAt(0).toUpperCase() + s.slice(1); }
+
+</script>
+</body>
+</html>
